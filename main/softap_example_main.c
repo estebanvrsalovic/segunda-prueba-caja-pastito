@@ -18,6 +18,14 @@
 #include "lwip/err.h"
 #include "lwip/sys.h"
 
+#include "esp_http_server.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_system.h"
+
+/* Forward declaration for OTA server starter */
+void start_ota_server(void);
+
 /* The examples use WiFi configuration that you can set via project configuration menu.
 
    If you'd rather not, just change the below entries to strings with
@@ -114,4 +122,101 @@ void app_main(void)
 
     ESP_LOGI(TAG, "ESP_WIFI_MODE_AP");
     wifi_init_softap();
+    /* Start OTA upload server after AP started */
+    start_ota_server();
+}
+
+static const char *upload_page =
+    "<html><body>"
+    "<h2>OTA Upload</h2>"
+    "<form method=POST enctype=multipart/form-data action=/upload>" 
+    "<input type=file name=file><input type=submit value=Upload></form>"
+    "</body></html>";
+
+static esp_err_t upload_get_handler(httpd_req_t *req)
+{
+    httpd_resp_send(req, upload_page, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t upload_post_handler(httpd_req_t *req)
+{
+    esp_err_t err;
+    esp_ota_handle_t update_handle = 0;
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No partition");
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_begin failed");
+        return ESP_FAIL;
+    }
+
+    char buf[1024];
+    int received = 0;
+    while ((received = httpd_req_recv(req, buf, sizeof(buf))) > 0) {
+        esp_err_t write_err = esp_ota_write(update_handle, (const void *)buf, received);
+        if (write_err != ESP_OK) {
+            esp_ota_end(update_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Write failed");
+            return ESP_FAIL;
+        }
+    }
+
+    if (received < 0) {
+        esp_ota_end(update_handle);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive failed");
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_end(update_handle);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_end failed");
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "set boot failed");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_sendstr(req, "OTA OK - rebooting");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
+static httpd_handle_t start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t get_uri = {
+            .uri       = "/",
+            .method    = HTTP_GET,
+            .handler   = upload_get_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &get_uri);
+
+        httpd_uri_t post_uri = {
+            .uri       = "/upload",
+            .method    = HTTP_POST,
+            .handler   = upload_post_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &post_uri);
+    }
+    return server;
+}
+
+void start_ota_server(void)
+{
+    start_webserver();
+    ESP_LOGI(TAG, "OTA server started: connect to device AP and open / to upload");
 }
